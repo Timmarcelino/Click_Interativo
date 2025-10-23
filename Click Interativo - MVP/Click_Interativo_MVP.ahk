@@ -2,15 +2,13 @@
 #SingleInstance Force
 
 ; ============================================
-; Click Interativo — MVP v2.1
+; Click Interativo — MVP v2.1.1 
 ; ============================================
-; - "Encerrar em" separado (Data/Hora), desativados até marcar "Usar data/hora".
-; - Removidos da UI: "Ativar janela antes do clique" (sempre verdadeiro) e
-;   "Restaurar foco & cursor" (sempre verdadeiro para cliques por coordenadas).
-; - ControlClick/ClassNN ocultos/inativos: apenas cliques por coordenadas.
-; - Aviso de atalho: ESC encerra o ciclo.
-; - Mantidos: contador regressivo “Falta(s)”, drift (↑→↓←), jitter ±s alternado,
-;   feedback visual no ponto, SetTimer único, persistência INI, intervalos em segundos.
+; Mantém: Data/Hora de término (opcional), contador “Falta(s)”,
+; drift (↑→↓←), jitter ±s alternado, feedback anel pulsante,
+; SetTimer único, persistência INI, intervalos por ponto (segundos),
+; ESC encerra ciclo.
+; Novo: garantia de 1 clique por vez (lock + lacuna global + stagger).
 
 SendMode "Input"
 CoordMode "Mouse", "Client"      ; Click/MouseGetPos relativos à área cliente
@@ -27,31 +25,36 @@ global gCounters := {clicks: 0, startedAt: 0}
 global gLastCountdownRefresh := 0
 global gJitterSec := 1
 
+; ----- Anti-concorrência -----
+global gClickLock := false             ; true enquanto um clique está em execução
+global gLastGlobalClickMs := 0
+global gMinInterClickMs := 60          ; lacuna mínima entre cliques (ms)
+global gStaggerMs := 50                ; offset inicial por ponto ao iniciar o ciclo (ms)
+
 ; ---------- GUI principal ----------
 g := Gui("", "Click Interativo")
 g.SetFont("s10")
 
-; Barra de controlo
 btnAdd     := g.Add("Button", "w200", "Configurar Ponto de Interação")
 btnTest    := g.Add("Button", "x+6 w130", "Testar Ponto")
 btnRemove  := g.Add("Button", "x+6 w130", "Remover Ponto")
 
-; ListView (colunas simplificadas)
 ; 1:ID 2:Janela 3:x 4:y 5:Intervalo(s) 6:Falta(s) 7:Ativo
 lv := g.Add("ListView", "xm w820 h260 Grid", ["ID","Janela/Aplicação","x","y","Intervalo(s)","Falta(s)","Ativo"])
 lv.ModifyCol(1, 40), lv.ModifyCol(2, 360), lv.ModifyCol(3, 60), lv.ModifyCol(4, 60)
 lv.ModifyCol(5, 100), lv.ModifyCol(6, 90), lv.ModifyCol(7, 70)
 
-; Linha de agendamento
+; Agendamento
 g.Add("Text", "xm y+6", "Encerrar em:")
-dtDate := g.Add("DateTime", "x+6 w140", "yyyy-MM-dd")  ; Data
-dtTime := g.Add("DateTime", "x+6 w120", "HH:mm")       ; Hora
+dtDate := g.Add("DateTime", "x+6 w140", "yyyy-MM-dd")
+dtTime := g.Add("DateTime", "x+6 w120", "HH:mm")
 cbUseEnd := g.Add("CheckBox", "x+8", "Usar data/hora")
 
-; Resta: jitter e botões do ciclo
+; Jitter
 g.Add("Text", "xm y+10", "Jitter (±s):")
 edJitter := g.Add("Edit", "x+6 w60 Number", "1")
 
+; Controlo do ciclo
 btnStart  := g.Add("Button", "xm y+10 w150 Default", "Iniciar Ciclo")
 btnPause  := g.Add("Button", "x+6 w120 Disabled", "Pausar")
 btnResume := g.Add("Button", "x+6 w120 Disabled", "Retomar")
@@ -68,15 +71,13 @@ btnStart.OnEvent("Click", StartCycle)
 btnPause.OnEvent("Click", PauseCycle)
 btnResume.OnEvent("Click", ResumeCycle)
 btnStop.OnEvent("Click", StopCycle)
-
-; Checkbox habilita/desabilita os DateTime
 cbUseEnd.OnEvent("Click", (*) => ToggleEndInputs(cbUseEnd.Value=1))
 
 ; Hotkey: encerrar ciclo (não fecha script)
 Esc:: StopCycle()
 
 ; Inicialização de valores nos DateTime e estado desativado
-dtDate.Value := A_Now, dtTime.Value := A_Now          ; aceita YYYYMMDDHH24MISS. :contentReference[oaicite:2]{index=2}
+dtDate.Value := A_Now, dtTime.Value := A_Now
 ToggleEndInputs(false)
 
 g.Show()
@@ -90,7 +91,7 @@ RefreshList()
 ToggleEndInputs(enable) {
     dtDate.Enabled := enable
     dtTime.Enabled := enable
-} ; Enabled é a forma oficial de ativar/desativar controles. :contentReference[oaicite:3]{index=3}
+}
 
 ; ----- Wizard: Configurar Ponto de Interação (apenas coordenadas) -----
 AddPointWizard(*) {
@@ -116,7 +117,7 @@ AddPointWizard(*) {
     edX := w.Add("Edit", "w90 Number", "0")
     edY := w.Add("Edit", "x+8 w90 Number", "0")
     btCap := w.Add("Button", "x+8 w200", "Capturar coordenadas")
-    btCap.OnEvent("Click", CapturePoint.Bind(winHwnds, ddl, edX, edY))   ; OnEvent precisa de callback
+    btCap.OnEvent("Click", CapturePoint.Bind(winHwnds, ddl, edX, edY))
 
     w.Add("Text","xm y+10","Intervalo por Ponto (segundos):")
     edInterval := w.Add("Edit","w160 Number","1")
@@ -175,7 +176,7 @@ CapturePoint(winHwnds, ddl, edX, edY, *) {
     ActivateWindow("ahk_id " winHwnds[idx])
     ToolTip "Clique e solte no ponto de interação..."
     KeyWait "LButton", "D"
-    KeyWait "LButton", "U"     ; KeyWait aguarda pressionar/soltar. :contentReference[oaicite:4]{index=4}
+    KeyWait "LButton", "U"
     ToolTip
     MouseGetPos &mx, &my
     edX.Text := mx,  edY.Text := my
@@ -206,6 +207,8 @@ RemoveSelectedPoint(*) {
 ; ----- Ciclo de Interação -----
 StartCycle(*) {
     global gRunning, gPaused, gCounters, gEndAt, gPoints, btnStart, btnStop, btnPause, btnResume, lblStatus, dtDate, dtTime, cbUseEnd, edJitter, gJitterSec
+    global gClickLock, gLastGlobalClickMs
+
     if (gRunning)
         return
     if (gPoints.Length=0) {
@@ -218,18 +221,21 @@ StartCycle(*) {
 
     gRunning := true, gPaused := false
     gCounters := {clicks: 0, startedAt: A_TickCount}
+    gClickLock := false, gLastGlobalClickMs := 0
 
     if (cbUseEnd.Value=1) {
-        ; DateTime.Value devolve sempre YYYYMMDDHH24MISS; juntamos a data do 1º e a hora do 2º. :contentReference[oaicite:5]{index=5}
+        ; DateTime.Value retorna YYYYMMDDHH24MISS (data e hora); juntamos data do 1º e hora do 2º
         ds := dtDate.Value, ts := dtTime.Value
         gEndAt := SubStr(ds, 1, 8) . SubStr(ts, 9, 6)    ; YYYYMMDD + HHMISS
     } else
         gEndAt := ""
 
     now := A_TickCount
+    idx := 0
     for p in gPoints {
         if (p["active"]) {
-            p["nextDue"] := now
+            idx++
+            p["nextDue"] := now + (idx-1)*gStaggerMs   ; stagger inicial p/ evitar simultaneidade
             p["driftStep"] := 0
             p["jitterPhase"] := 0
         }
@@ -276,6 +282,8 @@ StopCycle(*) {
 
 SchedulerTick(*) {
     global gRunning, gPaused, gEndAt, gPoints, gCounters, lblStatus, gLastCountdownRefresh, lv
+    global gClickLock, gLastGlobalClickMs, gMinInterClickMs, gJitterSec
+
     if (!gRunning || gPaused)
         return
 
@@ -285,38 +293,73 @@ SchedulerTick(*) {
     }
 
     now := A_TickCount
-    for p in gPoints {
-        if (!p["active"])
-            continue
-        if (now < p["nextDue"])
-            continue
-        if !EnsureWindow(p) {
-            lblStatus.Text := "Janela alvo ausente. Encerrando ciclo."
-            StopCycle()
-            return
-        }
-        ok := DoOneClick(p)
-        if (!ok) {
-            lblStatus.Text := "Erro no clique. Encerrando ciclo."
-            StopCycle()
-            return
-        }
-        p["lastClick"] := now
 
-        ; próximo vencimento com jitter alternado ±
-        nextMs := p["intervalMs"]
-        if (gJitterSec > 0) {
-            jitter := gJitterSec * 1000
-            nextMs += (p["jitterPhase"] ? jitter : -jitter)
-            p["jitterPhase"] := !p["jitterPhase"]
-        }
-        nextMs := Max(100, nextMs)
-        p["nextDue"] := now + nextMs
-        gCounters.clicks += 1
-        lblStatus.Text := "Clique em: " p["title"] "  (" gCounters.clicks " total)  —  ESC encerra"
+    ; respeita lacuna mínima e não reentra
+    if (gClickLock || (now - gLastGlobalClickMs < gMinInterClickMs)) {
+        UpdateCountdowns(now)
+        return
     }
 
-    ; atualizar “Falta(s)” ~4x/seg
+    ; escolher UM ponto devido: o de menor nextDue
+    bestIdx := 0, bestDue := 0x7FFFFFFF
+    idx := 0
+    for p in gPoints {
+        idx++
+        if (!p["active"])
+            continue
+        if (now >= p["nextDue"] && p["nextDue"] < bestDue) {
+            bestDue := p["nextDue"]
+            bestIdx := idx
+        }
+    }
+
+    if (bestIdx = 0) {
+        UpdateCountdowns(now)
+        return
+    }
+
+    ; bloquear e executar um único clique
+    gClickLock := true
+    p := gPoints[bestIdx]
+
+    if !EnsureWindow(p) {
+        lblStatus.Text := "Janela alvo ausente. Encerrando ciclo."
+        gClickLock := false
+        StopCycle()
+        return
+    }
+
+    ok := DoOneClick(p)
+    if (!ok) {
+        lblStatus.Text := "Erro no clique. Encerrando ciclo."
+        gClickLock := false
+        StopCycle()
+        return
+    }
+
+    p["lastClick"] := now
+
+    ; próximo vencimento com jitter alternado ±
+    nextMs := p["intervalMs"]
+    if (gJitterSec > 0) {
+        jitter := gJitterSec * 1000
+        nextMs += (p["jitterPhase"] ? jitter : -jitter)
+        p["jitterPhase"] := !p["jitterPhase"]
+    }
+    nextMs := Max(100, nextMs)
+    p["nextDue"] := now + nextMs
+    gCounters.clicks += 1
+    lblStatus.Text := "Clique em: " p["title"] "  (" gCounters.clicks " total)  —  ESC encerra"
+
+    gLastGlobalClickMs := A_TickCount
+    gClickLock := false
+
+    ; atualizar contadores no fim do tick
+    UpdateCountdowns(A_TickCount)
+}
+
+UpdateCountdowns(now) {
+    global gLastCountdownRefresh, gPoints, lv
     if (now - gLastCountdownRefresh >= 250) {
         gLastCountdownRefresh := now
         idx := 0
@@ -327,7 +370,7 @@ SchedulerTick(*) {
                 continue
             }
             rem := Max(0, p["nextDue"] - now) / 1000.0
-            lv.Modify(idx, "Col6", Format("{:.1f}", rem))  ; atualizar célula (Col6). :contentReference[oaicite:6]{index=6}
+            lv.Modify(idx, "Col6", Format("{:.1f}", rem))
         }
     }
 }
@@ -354,11 +397,12 @@ DoOneClick(p) {
 
         ; clique por coordenadas (respeita CoordMode "Client")
         Click p["x"]+dx, p["y"]+dy
-        ; feedback visual no ponto clicado
-        ShowClickFX_ClientXY(targetHwnd, p["x"]+dx, p["y"]+dy)
+
+        ; feedback visual: anel pulsante em COORDENADAS DE ECRÃ
+        ShowClickRipple_ClientXY(targetHwnd, p["x"]+dx, p["y"]+dy)
+
         ; próximo passo do drift
         p["driftStep"] := Mod(p["driftStep"]+1, 4)
-
         success := true
     } catch as e {
         success := false
@@ -369,42 +413,59 @@ DoOneClick(p) {
     return success
 }
 
-; ----- Feedback visual ("●" por ~200ms)
-ShowClickFX_Mouse() {
-    CoordMode "Mouse", "Screen"
-    MouseGetPos &sx, &sy
-    ToolTip "●", sx+8, sy+8, 20
-    SetTimer (() => ToolTip(, , , 20)), -200
-    CoordMode "Mouse", "Client"
-}
-
-ShowClickFX_ClientXY(hwnd, cx, cy) {
+; =========================
+;  FEEDBACK VISUAL (anel)
+; =========================
+ShowClickRipple_ClientXY(hwnd, cx, cy) {
     if (!hwnd) {
-        ShowClickFX_Mouse()
+        CoordMode "Mouse", "Screen"
+        MouseGetPos &sx, &sy
+        CoordMode "Mouse", "Client"
+        ShowClickRipple_Screen(sx, sy)
         return
     }
     sx := cx, sy := cy
     if ClientToScreen(hwnd, &sx, &sy) {
-        ToolTip "●", sx+6, sy+6, 20
-        SetTimer (() => ToolTip(, , , 20)), -200
+        ShowClickRipple_Screen(sx, sy)
     }
 }
 
-ClientToScreen(hwnd, &x, &y) {
+ShowClickRipple_Screen(sx, sy) {
     try {
-        pt := Buffer(8, 0)
-        NumPut("Int", x, pt, 0), NumPut("Int", y, pt, 4)
-        DllCall("ClientToScreen", "ptr", hwnd, "ptr", pt)
-        x := NumGet(pt, 0, "Int"), y := NumGet(pt, 4, "Int")
-        return true
+        fx := Gui("+AlwaysOnTop -Caption +ToolWindow +E0x20 -DPIScale")
+        fx.BackColor := "Red"
+        frames := [ Map("r",12,"a",230)
+                  , Map("r",18,"a",170)
+                  , Map("r",24,"a",110)
+                  , Map("r",30,"a",70) ]
+        idx := 1
+        showFrame := (*) => (
+            idx > frames.Length
+                ? ( SetTimer(showFrame, 0), TryDestroyGui(fx) )
+                : ( DrawRippleFrame(fx, sx, sy, frames[idx]["r"], frames[idx]["a"]), idx++ )
+        )
+        showFrame()
+        SetTimer showFrame, 50
     } catch {
-        return false
+        ToolTip "●", sx+6, sy+6, 20
+        SetTimer (() => ToolTip(, , , 20)), -250
     }
+}
+
+DrawRippleFrame(fx, sx, sy, r, alpha) {
+    w := r*2, h := w
+    fx.Show("NA x" (sx - r) " y" (sy - r) " w" w " h" h)
+    WinSetTransparent alpha, fx.Hwnd
+    WinSetRegion "0-0 w" w " h" h " E", fx.Hwnd
+}
+
+TryDestroyGui(fx) {
+    try fx.Destroy()
 }
 
 ; ----- Contexto do utilizador -----
 SaveUserContext() {
-    activeHwnd := WinExist("A")                  ; janela ativa atual. :contentReference[oaicite:7]{index=7}
+    activeHwnd := WinExist("A")
     CoordMode "Mouse", "Screen"
     MouseGetPos &sx, &sy
     CoordMode "Mouse", "Client"
@@ -527,4 +588,17 @@ SavePointsToIni() {
 SafeInt(val, def := 0) {
     val := Trim(val)
     return IsNumber(val) ? Integer(val) : def
+}
+
+; ----- Conversão cliente→ecrã (WinAPI) -----
+ClientToScreen(hwnd, &x, &y) {
+    try {
+        pt := Buffer(8, 0)
+        NumPut("Int", x, pt, 0), NumPut("Int", y, pt, 4)
+        DllCall("ClientToScreen", "ptr", hwnd, "ptr", pt)
+        x := NumGet(pt, 0, "Int"), y := NumGet(pt, 4, "Int")
+        return true
+    } catch {
+        return false
+    }
 }
