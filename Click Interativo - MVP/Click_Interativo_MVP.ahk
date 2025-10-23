@@ -2,16 +2,17 @@
 #SingleInstance Force
 
 ; =========================
-; Click Interativo — MVP v1.1.1 (hot fix 1)
+; Click Interativo — MVP v1.1.2 (hot fix 2)
 ; =========================
-; - Intervalo por Ponto em **segundos** (UI e INI). Internamente converte para ms.
-; - Hot fix: escopo de variáveis globais dentro das funções (Start/Pause/Resume/Stop/SchedulerTick).
+; - Intervalo por Ponto em **segundos** (UI e INI) → agenda em ms internamente.
+; - Hot fix: parse robusto do INI (não chamar Integer/Number com string vazia).
+; - Hot fix anterior mantido: 'global' em funções que atribuem a globais.
 ; - Restauração opcional de foco & cursor após cada clique por coordenadas.
-; - Um SetTimer global (round-robin). Encerramento por data/hora opcional, ou por Esc/erro/janela ausente.
-; - Encerrar ciclo NÃO fecha o script.
+; - Um SetTimer global (round-robin). Encerrar por data/hora opcional, Esc/erro/janela ausente.
+; - Encerrar CICLO não fecha o script.
 
 SendMode "Input"
-CoordMode "Mouse", "Client"  ; Click/MouseGetPos ficam relativos à área cliente da janela ativa.
+CoordMode "Mouse", "Client"  ; Click/MouseGetPos relativos à área cliente da janela ativa.
 
 ; ---------- Persistência ----------
 iniFile := A_ScriptDir "\Click_Interativo.ini"
@@ -19,8 +20,8 @@ iniFile := A_ScriptDir "\Click_Interativo.ini"
 ; ---------- Estado ----------
 global gPoints := []            ; {id,title,hwnd,exe,cls,titlePart,coordMode,x,y,useCtrl,classNN,intervalSec,intervalMs,activateBefore,active,nextDue,lastClick}
 global gRunning := false, gPaused := false
-global gTickMs := 100           ; período do scheduler (não é o intervalo dos pontos)
-global gEndAt := ""             ; timestamp "YYYYMMDDHH24MISS" (vazio = sem fim programado)
+global gTickMs := 100
+global gEndAt := ""             ; YYYYMMDDHH24MISS
 global gCounters := {clicks: 0, startedAt: 0}
 
 ; ---------- GUI principal ----------
@@ -43,7 +44,7 @@ g.Add("Text", "x+12", "Encerrar em:")
 dtEnd := g.Add("DateTime", "x+6 w200", "yyyy-MM-dd HH:mm")
 cbUseEnd := g.Add("CheckBox", "x+6", "Usar data/hora")
 
-; Restauração de contexto (foco & cursor) para cliques por coordenadas
+; Restauração de contexto (foco & cursor) p/ cliques por coordenadas
 global cbRestore := g.Add("CheckBox", "xm y+10 Checked", "Restaurar foco & cursor após clique (modo Coordenadas)")
 
 ; Controlo do ciclo
@@ -63,7 +64,7 @@ btnPause.OnEvent("Click", PauseCycle)
 btnResume.OnEvent("Click", ResumeCycle)
 btnStop.OnEvent("Click", StopCycle)
 
-; Hotkey de encerramento do ciclo (não fecha o script)
+; Hotkey: encerrar ciclo (não fecha script)
 Esc:: StopCycle()
 
 g.Show()
@@ -136,9 +137,8 @@ AddPointWizard(*) {
             MsgBox "Defina coordenadas válidas."
             return
         }
-        sec := Integer(edInterval.Text)
-        if (sec = "" || sec < 1)
-            sec := 1
+        secText := Trim(edInterval.Text)
+        sec := (IsNumber(secText) ? Max(1, Integer(secText)) : 1)   ; validação segura. :contentReference[oaicite:1]{index=1}
         useCtrl := rbCtrl.Value = 1
         classNN := edClass.Text
         act := cbAct.Value = 1
@@ -167,7 +167,7 @@ AddPointWizard(*) {
     w.Show()
 }
 
-; --- Handler: capturar coordenadas ---
+; --- Capturar coordenadas ---
 CapturePoint(winHwnds, ddl, edX, edY, *) {
     idx := ddl.Value
     if (idx = 0) {
@@ -216,7 +216,7 @@ StartCycle(*) {
     }
     gRunning := true, gPaused := false
     gCounters := {clicks: 0, startedAt: A_TickCount}
-    gEndAt := (cbUseEnd.Value=1) ? dtEnd.Value : ""   ; YYYYMMDDHH24MISS vs A_Now. :contentReference[oaicite:2]{index=2}
+    gEndAt := (cbUseEnd.Value=1) ? dtEnd.Value : ""   ; DateTime fornece YYYYMMDDHH24MISS, comparável com A_Now. :contentReference[oaicite:2]{index=2}
 
     now := A_TickCount
     for p in gPoints
@@ -226,7 +226,7 @@ StartCycle(*) {
     btnStart.Enabled := false, btnStop.Enabled := true
     btnPause.Enabled := true, btnResume.Enabled := false
     lblStatus.Text := "Ciclo em execução…"
-    SetTimer SchedulerTick, gTickMs                      ; agenda sem bloquear a GUI. :contentReference[oaicite:3]{index=3}
+    SetTimer SchedulerTick, gTickMs
 }
 
 PauseCycle(*) {
@@ -295,7 +295,7 @@ SchedulerTick(*) {
     }
 }
 
-; -------- Clique segundo o modo do ponto + restauração de contexto (quando aplicável)
+; -------- Clique + restauração de contexto (quando aplicável)
 DoOneClick(p) {
     prevCtx := ""
     if (!p["useCtrl"] && cbRestore.Value = 1)
@@ -312,13 +312,13 @@ DoOneClick(p) {
         targetHwnd := WinExist(targetSpec)
 
         if (p["useCtrl"]) {
-            SetControlDelay -1                       ; melhora fiabilidade do ControlClick. :contentReference[oaicite:4]{index=4}
+            SetControlDelay -1
             if (p["classNN"]!="")
                 ControlClick p["classNN"], targetSpec, , "Left", 1, "NA"
             else
                 ControlClick "x" p["x"] " y" p["y"], targetSpec, , "Left", 1, "NA"
         } else {
-            Click p["x"], p["y"]                    ; respeita CoordMode "Client"
+            Click p["x"], p["y"]     ; respeita CoordMode "Client"
         }
         success := true
     } catch as e {
@@ -331,9 +331,9 @@ DoOneClick(p) {
     return success
 }
 
-; ----- Contexto do utilizador: salvar/recuperar janela ativa e cursor (em ecrã)
+; ----- Contexto do utilizador -----
 SaveUserContext() {
-    activeHwnd := WinExist("A")                    ; janela ativa (HWND). :contentReference[oaicite:5]{index=5}
+    activeHwnd := WinExist("A")
     CoordMode "Mouse", "Screen"
     MouseGetPos &sx, &sy
     CoordMode "Mouse", "Client"
@@ -407,35 +407,42 @@ NewPointId() {
     return max+1
 }
 
+; --------- PARSER ROBUSTO DO INI (com compatibilidade)
 LoadPointsFromIni() {
     if !FileExist(iniFile)
         return
-    count := Integer(IniRead(iniFile, "Meta", "Count", "0"))
+    countText := IniRead(iniFile, "Meta", "Count", "0")
+    count := IsNumber(countText) ? Integer(countText) : 0    ; evita Integer("").
     Loop count {
         sec := "Point." A_Index
         p := Map()
-        p["id"] := Integer(IniRead(iniFile, sec, "id", A_Index))
+        p["id"] := SafeInt(IniRead(iniFile, sec, "id", A_Index))
         p["title"] := IniRead(iniFile, sec, "title", "")
-        p["hwnd"] := Integer(IniRead(iniFile, sec, "hwnd", "0"))
+        p["hwnd"] := SafeInt(IniRead(iniFile, sec, "hwnd", "0"))
         p["exe"] := IniRead(iniFile, sec, "exe", "")
         p["cls"] := IniRead(iniFile, sec, "cls", "")
         p["titlePart"] := IniRead(iniFile, sec, "titlePart", "")
         p["coordMode"] := IniRead(iniFile, sec, "coordMode", "Client")
-        p["x"] := Integer(IniRead(iniFile, sec, "x", "0"))
-        p["y"] := Integer(IniRead(iniFile, sec, "y", "0"))
+        p["x"] := SafeInt(IniRead(iniFile, sec, "x", "0"))
+        p["y"] := SafeInt(IniRead(iniFile, sec, "y", "0"))
         p["useCtrl"] := IniRead(iniFile, sec, "useCtrl", "0") = "1"
         p["classNN"] := IniRead(iniFile, sec, "classNN", "")
-        ; compatibilidade: lê 'intervalSec' (novo). Se ausente, tenta 'intervalMs' (antigo).
-        intervalSec := Integer(IniRead(iniFile, sec, "intervalSec", ""))
-        if (intervalSec = "") {
-            oldMs := Integer(IniRead(iniFile, sec, "intervalMs", "1000"))
-            intervalSec := Max(1, Round(oldMs/1000))
+
+        ; --- NOVO: intervalo em segundos com fallback ao legado 'intervalMs' ---
+        secText := Trim(IniRead(iniFile, sec, "intervalSec", ""))   ; pode vir "" num INI antigo
+        if (IsNumber(secText)) {
+            intervalSec := Max(1, Integer(secText))
+        } else {
+            msText := Trim(IniRead(iniFile, sec, "intervalMs", "")) ; antigo
+            intervalSec := IsNumber(msText) ? Max(1, Ceil(Integer(msText)/1000.0)) : 1
         }
         p["intervalSec"] := intervalSec
         p["intervalMs"] := intervalSec * 1000
+
         p["activateBefore"] := IniRead(iniFile, sec, "activateBefore", "1") = "1"
         p["active"] := IniRead(iniFile, sec, "active", "1") = "1"
         p["nextDue"] := 0, p["lastClick"] := 0
+
         gPoints.Push(p)
     }
 }
@@ -457,8 +464,14 @@ SavePointsToIni() {
         IniWrite p["y"], iniFile, sec, "y"
         IniWrite (p["useCtrl"]?1:0), iniFile, sec, "useCtrl"
         IniWrite p["classNN"], iniFile, sec, "classNN"
-        IniWrite p["intervalSec"], iniFile, sec, "intervalSec"  ; *** novo padrão em segundos ***
+        IniWrite p["intervalSec"], iniFile, sec, "intervalSec"  ; padrão atual
         IniWrite (p["activateBefore"]?1:0), iniFile, sec, "activateBefore"
         IniWrite (p["active"]?1:0), iniFile, sec, "active"
     }
+}
+
+; Helper: conversão segura para inteiro ("" → default)
+SafeInt(val, def := 0) {
+    val := Trim(val)
+    return IsNumber(val) ? Integer(val) : def
 }
