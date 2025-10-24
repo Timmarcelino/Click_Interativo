@@ -2,13 +2,14 @@
 #SingleInstance Force
 
 ; ============================================
-; Click Interativo — MVP v2.1.3  (fix: OnSize antes de InitLayout)
+; Click Interativo — MVP v2.1.4 janela unívoca
 ; ============================================
-; - Janela redimensionável pelo utilizador (âncoras simples)
-; - Exclusão mútua: 1 clique por vez (lock + lacuna + stagger)
-; - Contador “Falta(s)”, drift ↑→↓←, jitter ±s alternado
-; - Feedback visual (anel), ESC encerra, INI, intervalos em segundos
-; - FIX: OnSize só é registrado após InitLayout; guard dentro de Gui_OnSize
+; Novidade: identificação única da janela
+; - Captura: salva hwnd, pid, título e tamanho do cliente (cw,ch)
+; - Ativação: usa ahk_id quando possível; fallback com heurística
+;   (PID+classe -> exe+classe) + (título/cliente mais próximos).
+; Mantido: anti-concorrência, jitter ±s, drift ↑→↓←, feedback anel,
+; redimensionável, INI, “Falta(s)”, ESC encerra.
 
 SendMode "Input"
 CoordMode "Mouse", "Client"
@@ -17,7 +18,7 @@ CoordMode "Mouse", "Client"
 iniFile := A_ScriptDir "\Click_Interativo.ini"
 
 ; ---------- Estado ----------
-global gPoints := []
+global gPoints := []   ; {id,title,hwnd,exe,cls,x,y,intervalSec,intervalMs,active,nextDue,lastClick,driftStep,jitterPhase,pid,cw,ch}
 global gRunning := false, gPaused := false
 global gTickMs := 100
 global gEndAt := ""                    ; YYYYMMDDHH24MISS
@@ -32,7 +33,7 @@ global gMinInterClickMs := 60
 global gStaggerMs := 50
 
 ; ----- Layout base (para redimensionamento) -----
-global gLayout := Map()  ; será preenchido em InitLayout()
+global gLayout := Map()
 
 ; ---------- GUI principal ----------
 g := Gui("+Resize", "Click Interativo")
@@ -83,10 +84,10 @@ Esc:: StopCycle()
 dtDate.Value := A_Now, dtTime.Value := A_Now
 ToggleEndInputs(false)
 
-; --- Mostrar, inicializar layout e SÓ DEPOIS conectar o OnSize ---
+; --- Mostrar, inicializar layout e registrar OnSize ---
 g.Show()
-InitLayout()                 ; define gLayout + MinSize
-g.OnEvent("Size", Gui_OnSize)  ; <— agora é seguro
+InitLayout()
+g.OnEvent("Size", Gui_OnSize)
 
 LoadPointsFromIni()
 RefreshList()
@@ -97,11 +98,9 @@ RefreshList()
 
 InitLayout() {
     global gLayout, g
-    ; Tamanho base da janela
     g.GetPos(, , &w, &h)
     gLayout["baseW"] := w, gLayout["baseH"] := h
 
-    ; Posições/dimensões base dos elementos que vamos mover/redimensionar
     lv.GetPos(&lvx,&lvy,&lvw,&lvh)
     gLayout["lvX"] := lvx, gLayout["lvY"] := lvy, gLayout["lvW"] := lvw, gLayout["lvH"] := lvh
 
@@ -117,32 +116,25 @@ InitLayout() {
 
     lblStatus.GetPos(&lsX, &lsY, &lsW, &lsH)
     gLayout["lsX"] := lsX, gLayout["lsY"] := lsY, gLayout["lsW"] := lsW
-
     lblEsc.GetPos(, &escY), gLayout["escY"] := escY
 
-    ; Tamanho mínimo igual ao tamanho inicial
     g.MinSize := w "x" h
 }
 
 Gui_OnSize(thisGui, MinMax, W, H) {
-    ; Minimizado? não recalcula
     if (MinMax = 1)
         return
     global gLayout
-
-    ; Guard: se ainda não inicializou o layout, sai sem erro
-    if !(gLayout.Has("baseW"))  ; evita "Item has no value"
+    if !(gLayout.Has("baseW"))
         return
 
     dw := W - gLayout["baseW"]
     dh := H - gLayout["baseH"]
 
-    ; --- ListView expande em largura e altura ---
     newLVW := Max(400, gLayout["lvW"] + dw)
     newLVH := Max(120, gLayout["lvH"] + dh)
     lv.Move(, , newLVW, newLVH)
 
-    ; --- Seções abaixo do LV descem/subem ---
     ny := gLayout["encY"] + dh, lblEnc.Move(, ny)
     ny := gLayout["dtY"]  + dh, dtDate.Move(, ny), dtTime.Move(, ny), cbUseEnd.Move(, ny)
 
@@ -154,12 +146,10 @@ Gui_OnSize(thisGui, MinMax, W, H) {
     ny := gLayout["rsY"] + dh, btnResume.Move(, ny)
     ny := gLayout["spY"] + dh, btnStop.Move(, ny)
 
-    ; Status expande em largura e desce
     ny := gLayout["lsY"] + dh
     newLSW := Max(300, gLayout["lsW"] + dw)
     lblStatus.Move(gLayout["lsX"], ny, newLSW)
 
-    ; Dica ESC desce
     ny := gLayout["escY"] + dh, lblEsc.Move(, ny)
 }
 
@@ -208,10 +198,11 @@ AddPointWizard(*) {
         if (idx=0)
             return
         hwnd := winHwnds[idx]
-        title := "", exe := "", cls := ""
+        title := "", exe := "", cls := "", pid := 0
         try title := WinGetTitle("ahk_id " hwnd)
         try exe := WinGetProcessName("ahk_id " hwnd)
         try cls := WinGetClass("ahk_id " hwnd)
+        try pid := WinGetPID("ahk_id " hwnd)
 
         x := Integer(edX.Text), y := Integer(edY.Text)
         if (x = "" || y = "") {
@@ -221,12 +212,18 @@ AddPointWizard(*) {
         secText := Trim(edInterval.Text)
         sec := (IsNumber(secText) ? Max(1, Integer(secText)) : 1)
 
+        cw := 0, ch := 0
+        GetClientSize(hwnd, &cw, &ch)
+
         p := Map()
         p["id"] := NewPointId()
         p["title"] := title
         p["hwnd"] := hwnd
+        p["pid"] := pid
         p["exe"] := exe
         p["cls"] := cls
+        p["cw"] := cw
+        p["ch"] := ch
         p["x"] := x, p["y"] := y
         p["intervalSec"] := sec
         p["intervalMs"] := sec * 1000
@@ -299,7 +296,7 @@ StartCycle(*) {
 
     if (cbUseEnd.Value=1) {
         ds := dtDate.Value, ts := dtTime.Value
-        gEndAt := SubStr(ds, 1, 8) . SubStr(ts, 9, 6)    ; YYYYMMDD + HHMISS
+        gEndAt := SubStr(ds, 1, 8) . SubStr(ts, 9, 6)
     } else
         gEndAt := ""
 
@@ -366,13 +363,11 @@ SchedulerTick(*) {
 
     now := A_TickCount
 
-    ; respeita lacuna mínima e não reentra
     if (gClickLock || (now - gLastGlobalClickMs < gMinInterClickMs)) {
         UpdateCountdowns(now)
         return
     }
 
-    ; escolher UM ponto devido: o de menor nextDue
     bestIdx := 0, bestDue := 0x7FFFFFFF
     idx := 0
     for p in gPoints {
@@ -390,7 +385,6 @@ SchedulerTick(*) {
         return
     }
 
-    ; bloquear e executar um único clique
     gClickLock := true
     p := gPoints[bestIdx]
 
@@ -411,7 +405,6 @@ SchedulerTick(*) {
 
     p["lastClick"] := now
 
-    ; próximo vencimento com jitter alternado ±
     nextMs := p["intervalMs"]
     if (gJitterSec > 0) {
         jitter := gJitterSec * 1000
@@ -450,17 +443,20 @@ UpdateCountdowns(now) {
 DoOneClick(p) {
     prevCtx := SaveUserContext()
     success := false
-    targetSpec := BuildWinTitle(p)
-    targetHwnd := 0
 
-    drift := [[0,-1],[1,0],[0,1],[-1,0]]
-    step := Mod(p["driftStep"], 4)
-    dx := drift[step+1][1], dy := drift[step+1][2]
-
+    ; Ativa SEMPRE por ahk_id quando tivermos hwnd válido
+    target := EnsureWindow(p) ? "ahk_id " p["hwnd"] : ""
     try {
-        if !ActivateWindow(targetSpec)
+        if (!target)
+            throw Error("Sem janela alvo.")
+        if !ActivateWindow(target)
             throw Error("Falha ao ativar janela alvo.")
-        targetHwnd := WinExist(targetSpec)
+        targetHwnd := WinExist(target)
+
+        ; drift 1px no padrão ↑→↓←
+        drift := [[0,-1],[1,0],[0,1],[-1,0]]
+        step := Mod(p["driftStep"], 4)
+        dx := drift[step+1][1], dy := drift[step+1][2]
 
         Click p["x"]+dx, p["y"]+dy
         ShowClickRipple_ClientXY(targetHwnd, p["x"]+dx, p["y"]+dy)
@@ -470,8 +466,7 @@ DoOneClick(p) {
     } catch as e {
         success := false
     }
-
-    RestoreUserContext(prevCtx, targetHwnd)
+    RestoreUserContext(prevCtx)
     return success
 }
 
@@ -533,10 +528,9 @@ SaveUserContext() {
     CoordMode "Mouse", "Client"
     return Map("hwnd", activeHwnd, "x", sx, "y", sy)
 }
-
-RestoreUserContext(ctx, targetHwnd := 0) {
+RestoreUserContext(ctx) {
     try {
-        if (ctx.Has("hwnd") && ctx["hwnd"] && ctx["hwnd"] != targetHwnd && WinExist("ahk_id " ctx["hwnd"])) {
+        if (ctx.Has("hwnd") && ctx["hwnd"] && WinExist("ahk_id " ctx["hwnd"])) {
             WinActivate "ahk_id " ctx["hwnd"]
             WinWaitActive "ahk_id " ctx["hwnd"], , 1
         }
@@ -549,15 +543,72 @@ RestoreUserContext(ctx, targetHwnd := 0) {
 
 ; ----- Janela alvo / helpers -----
 EnsureWindow(p) {
-    if (p["hwnd"] && WinExist("ahk_id " p["hwnd"]))
+    ; 1) Se hwnd válido: ok
+    if (p.Has("hwnd") && p["hwnd"] && WinExist("ahk_id " p["hwnd"]))
         return true
-    spec := BuildWinTitle(p)
-    hwnd := WinExist(spec)
-    if (hwnd) {
-        p["hwnd"] := hwnd
+
+    ; 2) Tenta encontrar por PID + classe
+    cand := []
+    if (p.Has("pid") && p["pid"]) {
+        try {
+            for hwnd in WinGetList("ahk_pid " p["pid"] " ahk_class " p["cls"])
+                cand.Push(hwnd)
+        }
+    }
+
+    ; 3) Se não achou, tenta por exe + classe
+    if (cand.Length=0) {
+        try {
+            for hwnd in WinGetList("ahk_exe " p["exe"] " ahk_class " p["cls"])
+                cand.Push(hwnd)
+        }
+    }
+
+    if (cand.Length=0)
+        return false
+
+    ; 4) Escolhe a melhor candidata pelo título e tamanho do cliente
+    best := PickBestWindow(cand, p)
+    if (best) {
+        p["hwnd"] := best
         return true
     }
     return false
+}
+
+PickBestWindow(candidates, p) {
+    best := 0, bestScore := 10**9
+    targetTitle := p.Has("title") ? p["title"] : ""
+    tcw := p.Has("cw") ? p["cw"] : 0
+    tch := p.Has("ch") ? p["ch"] : 0
+
+    for hwnd in candidates {
+        t := ""
+        try t := WinGetTitle("ahk_id " hwnd)
+
+        cw := 0, ch := 0
+        GetClientSize(hwnd, &cw, &ch)
+
+        ; score: menor é melhor
+        ; título: igual (0), contém (10), diferente (30)
+        titleScore := 30
+        if (targetTitle != "") {
+            if (t = targetTitle)
+                titleScore := 0
+            else if InStr(t, targetTitle)
+                titleScore := 10
+        }
+
+        ; tamanho do cliente: distância Manhattan
+        sizeScore := (tcw>0 && tch>0) ? Abs(cw - tcw) + Abs(ch - tch) : 50
+
+        s := titleScore*1000 + sizeScore  ; título pesa mais
+        if (s < bestScore) {
+            bestScore := s
+            best := hwnd
+        }
+    }
+    return best
 }
 
 BuildWinTitle(p) {
@@ -603,8 +654,11 @@ LoadPointsFromIni() {
         p["id"] := SafeInt(IniRead(iniFile, sec, "id", A_Index))
         p["title"] := IniRead(iniFile, sec, "title", "")
         p["hwnd"] := SafeInt(IniRead(iniFile, sec, "hwnd", "0"))
+        p["pid"] := SafeInt(IniRead(iniFile, sec, "pid", "0"))
         p["exe"] := IniRead(iniFile, sec, "exe", "")
         p["cls"] := IniRead(iniFile, sec, "cls", "")
+        p["cw"] := SafeInt(IniRead(iniFile, sec, "cw", "0"))
+        p["ch"] := SafeInt(IniRead(iniFile, sec, "ch", "0"))
         p["x"] := SafeInt(IniRead(iniFile, sec, "x", "0"))
         p["y"] := SafeInt(IniRead(iniFile, sec, "y", "0"))
 
@@ -636,8 +690,11 @@ SavePointsToIni() {
         IniWrite p["id"], iniFile, sec, "id"
         IniWrite p["title"], iniFile, sec, "title"
         IniWrite p["hwnd"], iniFile, sec, "hwnd"
+        IniWrite p["pid"], iniFile, sec, "pid"
         IniWrite p["exe"], iniFile, sec, "exe"
         IniWrite p["cls"], iniFile, sec, "cls"
+        IniWrite p["cw"], iniFile, sec, "cw"
+        IniWrite p["ch"], iniFile, sec, "ch"
         IniWrite p["x"], iniFile, sec, "x"
         IniWrite p["y"], iniFile, sec, "y"
         IniWrite p["intervalSec"], iniFile, sec, "intervalSec"
@@ -650,7 +707,7 @@ SafeInt(val, def := 0) {
     return IsNumber(val) ? Integer(val) : def
 }
 
-; ----- Conversão cliente→ecrã -----
+; ----- WinAPI helpers -----
 ClientToScreen(hwnd, &x, &y) {
     try {
         pt := Buffer(8, 0)
@@ -661,4 +718,17 @@ ClientToScreen(hwnd, &x, &y) {
     } catch {
         return false
     }
+}
+
+GetClientSize(hwnd, &w, &h) {
+    w := 0, h := 0
+    try {
+        rect := Buffer(16, 0) ; RECT {left,top,right,bottom}
+        if DllCall("GetClientRect", "ptr", hwnd, "ptr", rect) {
+            w := NumGet(rect, 8, "Int")
+            h := NumGet(rect, 12, "Int")
+            return true
+        }
+    }
+    return false
 }
