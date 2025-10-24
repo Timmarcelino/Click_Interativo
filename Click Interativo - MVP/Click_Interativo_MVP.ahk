@@ -2,22 +2,22 @@
 #SingleInstance Force
 
 ; ============================================
-; Click Interativo — MVP v2.1.1 
+; Click Interativo — MVP v2.1.3  (fix: OnSize antes de InitLayout)
 ; ============================================
-; Mantém: Data/Hora de término (opcional), contador “Falta(s)”,
-; drift (↑→↓←), jitter ±s alternado, feedback anel pulsante,
-; SetTimer único, persistência INI, intervalos por ponto (segundos),
-; ESC encerra ciclo.
-; Novo: garantia de 1 clique por vez (lock + lacuna global + stagger).
+; - Janela redimensionável pelo utilizador (âncoras simples)
+; - Exclusão mútua: 1 clique por vez (lock + lacuna + stagger)
+; - Contador “Falta(s)”, drift ↑→↓←, jitter ±s alternado
+; - Feedback visual (anel), ESC encerra, INI, intervalos em segundos
+; - FIX: OnSize só é registrado após InitLayout; guard dentro de Gui_OnSize
 
 SendMode "Input"
-CoordMode "Mouse", "Client"      ; Click/MouseGetPos relativos à área cliente
+CoordMode "Mouse", "Client"
 
 ; ---------- Persistência ----------
 iniFile := A_ScriptDir "\Click_Interativo.ini"
 
 ; ---------- Estado ----------
-global gPoints := []   ; {id,title,hwnd,exe,cls,x,y,intervalSec,intervalMs,active,nextDue,lastClick,driftStep,jitterPhase}
+global gPoints := []
 global gRunning := false, gPaused := false
 global gTickMs := 100
 global gEndAt := ""                    ; YYYYMMDDHH24MISS
@@ -26,13 +26,16 @@ global gLastCountdownRefresh := 0
 global gJitterSec := 1
 
 ; ----- Anti-concorrência -----
-global gClickLock := false             ; true enquanto um clique está em execução
+global gClickLock := false
 global gLastGlobalClickMs := 0
-global gMinInterClickMs := 60          ; lacuna mínima entre cliques (ms)
-global gStaggerMs := 50                ; offset inicial por ponto ao iniciar o ciclo (ms)
+global gMinInterClickMs := 60
+global gStaggerMs := 50
+
+; ----- Layout base (para redimensionamento) -----
+global gLayout := Map()  ; será preenchido em InitLayout()
 
 ; ---------- GUI principal ----------
-g := Gui("", "Click Interativo")
+g := Gui("+Resize", "Click Interativo")
 g.SetFont("s10")
 
 btnAdd     := g.Add("Button", "w200", "Configurar Ponto de Interação")
@@ -45,13 +48,13 @@ lv.ModifyCol(1, 40), lv.ModifyCol(2, 360), lv.ModifyCol(3, 60), lv.ModifyCol(4, 
 lv.ModifyCol(5, 100), lv.ModifyCol(6, 90), lv.ModifyCol(7, 70)
 
 ; Agendamento
-g.Add("Text", "xm y+6", "Encerrar em:")
+lblEnc := g.Add("Text", "xm y+6", "Encerrar em:")
 dtDate := g.Add("DateTime", "x+6 w140", "yyyy-MM-dd")
 dtTime := g.Add("DateTime", "x+6 w120", "HH:mm")
 cbUseEnd := g.Add("CheckBox", "x+8", "Usar data/hora")
 
 ; Jitter
-g.Add("Text", "xm y+10", "Jitter (±s):")
+lblJit := g.Add("Text", "xm y+10", "Jitter (±s):")
 edJitter := g.Add("Edit", "x+6 w60 Number", "1")
 
 ; Controlo do ciclo
@@ -60,9 +63,9 @@ btnPause  := g.Add("Button", "x+6 w120 Disabled", "Pausar")
 btnResume := g.Add("Button", "x+6 w120 Disabled", "Retomar")
 btnStop   := g.Add("Button", "x+6 w150 Disabled", "Encerrar Ciclo")
 lblStatus := g.Add("Text", "xm y+8 w820", "Pronto.")
-g.Add("Text", "xm cGray", "Atalho: pressione ESC para encerrar o ciclo.")
+lblEsc    := g.Add("Text", "xm cGray", "Atalho: pressione ESC para encerrar o ciclo.")
 
-; Ligações de eventos
+; Eventos principais
 g.OnEvent("Close", (*) => (gRunning ? StopCycle() : ExitApp()))
 btnAdd.OnEvent("Click", AddPointWizard)
 btnTest.OnEvent("Click", TestSelectedPoint)
@@ -73,14 +76,18 @@ btnResume.OnEvent("Click", ResumeCycle)
 btnStop.OnEvent("Click", StopCycle)
 cbUseEnd.OnEvent("Click", (*) => ToggleEndInputs(cbUseEnd.Value=1))
 
-; Hotkey: encerrar ciclo (não fecha script)
+; Hotkey: encerrar ciclo
 Esc:: StopCycle()
 
-; Inicialização de valores nos DateTime e estado desativado
+; Inicialização
 dtDate.Value := A_Now, dtTime.Value := A_Now
 ToggleEndInputs(false)
 
+; --- Mostrar, inicializar layout e SÓ DEPOIS conectar o OnSize ---
 g.Show()
+InitLayout()                 ; define gLayout + MinSize
+g.OnEvent("Size", Gui_OnSize)  ; <— agora é seguro
+
 LoadPointsFromIni()
 RefreshList()
 
@@ -88,12 +95,80 @@ RefreshList()
 ;              Implementação
 ; ============================================
 
+InitLayout() {
+    global gLayout, g
+    ; Tamanho base da janela
+    g.GetPos(, , &w, &h)
+    gLayout["baseW"] := w, gLayout["baseH"] := h
+
+    ; Posições/dimensões base dos elementos que vamos mover/redimensionar
+    lv.GetPos(&lvx,&lvy,&lvw,&lvh)
+    gLayout["lvX"] := lvx, gLayout["lvY"] := lvy, gLayout["lvW"] := lvw, gLayout["lvH"] := lvh
+
+    lblEnc.GetPos(, &encY), gLayout["encY"] := encY
+    dtDate.GetPos(, &dtY),  gLayout["dtY"]  := dtY
+    lblJit.GetPos(, &jitY), gLayout["jitY"] := jitY
+    edJitter.GetPos(, &jitEdY), gLayout["jitEdY"] := jitEdY
+
+    btnStart.GetPos(, &stY),   gLayout["stY"] := stY
+    btnPause.GetPos(, &psY),   gLayout["psY"] := psY
+    btnResume.GetPos(, &rsY),  gLayout["rsY"] := rsY
+    btnStop.GetPos(, &spY),    gLayout["spY"] := spY
+
+    lblStatus.GetPos(&lsX, &lsY, &lsW, &lsH)
+    gLayout["lsX"] := lsX, gLayout["lsY"] := lsY, gLayout["lsW"] := lsW
+
+    lblEsc.GetPos(, &escY), gLayout["escY"] := escY
+
+    ; Tamanho mínimo igual ao tamanho inicial
+    g.MinSize := w "x" h
+}
+
+Gui_OnSize(thisGui, MinMax, W, H) {
+    ; Minimizado? não recalcula
+    if (MinMax = 1)
+        return
+    global gLayout
+
+    ; Guard: se ainda não inicializou o layout, sai sem erro
+    if !(gLayout.Has("baseW"))  ; evita "Item has no value"
+        return
+
+    dw := W - gLayout["baseW"]
+    dh := H - gLayout["baseH"]
+
+    ; --- ListView expande em largura e altura ---
+    newLVW := Max(400, gLayout["lvW"] + dw)
+    newLVH := Max(120, gLayout["lvH"] + dh)
+    lv.Move(, , newLVW, newLVH)
+
+    ; --- Seções abaixo do LV descem/subem ---
+    ny := gLayout["encY"] + dh, lblEnc.Move(, ny)
+    ny := gLayout["dtY"]  + dh, dtDate.Move(, ny), dtTime.Move(, ny), cbUseEnd.Move(, ny)
+
+    ny := gLayout["jitY"] + dh, lblJit.Move(, ny)
+    ny := gLayout["jitEdY"] + dh, edJitter.Move(, ny)
+
+    ny := gLayout["stY"] + dh, btnStart.Move(, ny)
+    ny := gLayout["psY"] + dh, btnPause.Move(, ny)
+    ny := gLayout["rsY"] + dh, btnResume.Move(, ny)
+    ny := gLayout["spY"] + dh, btnStop.Move(, ny)
+
+    ; Status expande em largura e desce
+    ny := gLayout["lsY"] + dh
+    newLSW := Max(300, gLayout["lsW"] + dw)
+    lblStatus.Move(gLayout["lsX"], ny, newLSW)
+
+    ; Dica ESC desce
+    ny := gLayout["escY"] + dh, lblEsc.Move(, ny)
+}
+
 ToggleEndInputs(enable) {
     dtDate.Enabled := enable
     dtTime.Enabled := enable
 }
 
-; ----- Wizard: Configurar Ponto de Interação (apenas coordenadas) -----
+; ----- Wizard: Configurar Ponto de Interação -----
 AddPointWizard(*) {
     winHwnds := [], winRows := []
     for hwnd in WinGetList() {
@@ -166,7 +241,7 @@ AddPointWizard(*) {
     w.Show()
 }
 
-; --- Capturar coordenadas (pressione e solte o botão esquerdo) ---
+; --- Capturar coordenadas ---
 CapturePoint(winHwnds, ddl, edX, edY, *) {
     idx := ddl.Value
     if (idx = 0) {
@@ -215,7 +290,6 @@ StartCycle(*) {
         MsgBox "Adicione pelo menos um Ponto."
         return
     }
-    ; jitter global
     jt := Trim(edJitter.Text)
     gJitterSec := (IsNumber(jt) ? Abs(Integer(jt)) : 1)
 
@@ -224,7 +298,6 @@ StartCycle(*) {
     gClickLock := false, gLastGlobalClickMs := 0
 
     if (cbUseEnd.Value=1) {
-        ; DateTime.Value retorna YYYYMMDDHH24MISS (data e hora); juntamos data do 1º e hora do 2º
         ds := dtDate.Value, ts := dtTime.Value
         gEndAt := SubStr(ds, 1, 8) . SubStr(ts, 9, 6)    ; YYYYMMDD + HHMISS
     } else
@@ -235,7 +308,7 @@ StartCycle(*) {
     for p in gPoints {
         if (p["active"]) {
             idx++
-            p["nextDue"] := now + (idx-1)*gStaggerMs   ; stagger inicial p/ evitar simultaneidade
+            p["nextDue"] := now + (idx-1)*gStaggerMs
             p["driftStep"] := 0
             p["jitterPhase"] := 0
         }
@@ -286,7 +359,6 @@ SchedulerTick(*) {
 
     if (!gRunning || gPaused)
         return
-
     if (gEndAt != "" && A_Now >= gEndAt) {
         StopCycle()
         return
@@ -354,7 +426,6 @@ SchedulerTick(*) {
     gLastGlobalClickMs := A_TickCount
     gClickLock := false
 
-    ; atualizar contadores no fim do tick
     UpdateCountdowns(A_TickCount)
 }
 
@@ -377,38 +448,29 @@ UpdateCountdowns(now) {
 
 ; -------- Clique (coords) + drift + feedback + restauração de contexto
 DoOneClick(p) {
-    ; salvar contexto do utilizador SEMPRE (janela ativa + mouse em ecrã)
     prevCtx := SaveUserContext()
-
     success := false
     targetSpec := BuildWinTitle(p)
     targetHwnd := 0
 
-    ; micro-deslocamento (↑,→,↓,←)
     drift := [[0,-1],[1,0],[0,1],[-1,0]]
     step := Mod(p["driftStep"], 4)
     dx := drift[step+1][1], dy := drift[step+1][2]
 
     try {
-        ; ativar sempre a janela alvo
         if !ActivateWindow(targetSpec)
             throw Error("Falha ao ativar janela alvo.")
         targetHwnd := WinExist(targetSpec)
 
-        ; clique por coordenadas (respeita CoordMode "Client")
         Click p["x"]+dx, p["y"]+dy
-
-        ; feedback visual: anel pulsante em COORDENADAS DE ECRÃ
         ShowClickRipple_ClientXY(targetHwnd, p["x"]+dx, p["y"]+dy)
 
-        ; próximo passo do drift
         p["driftStep"] := Mod(p["driftStep"]+1, 4)
         success := true
     } catch as e {
         success := false
     }
 
-    ; restaurar janela/cursor do utilizador
     RestoreUserContext(prevCtx, targetHwnd)
     return success
 }
@@ -531,7 +593,6 @@ NewPointId() {
     return max+1
 }
 
-; Parser robusto do INI (compatível com versões anteriores)
 LoadPointsFromIni() {
     if !FileExist(iniFile)
         return
@@ -547,7 +608,6 @@ LoadPointsFromIni() {
         p["x"] := SafeInt(IniRead(iniFile, sec, "x", "0"))
         p["y"] := SafeInt(IniRead(iniFile, sec, "y", "0"))
 
-        ; intervalo em segundos com fallback legado (intervalMs)
         secText := Trim(IniRead(iniFile, sec, "intervalSec", ""))
         if (IsNumber(secText))
             intervalSec := Max(1, Integer(secText))
@@ -590,7 +650,7 @@ SafeInt(val, def := 0) {
     return IsNumber(val) ? Integer(val) : def
 }
 
-; ----- Conversão cliente→ecrã (WinAPI) -----
+; ----- Conversão cliente→ecrã -----
 ClientToScreen(hwnd, &x, &y) {
     try {
         pt := Buffer(8, 0)
